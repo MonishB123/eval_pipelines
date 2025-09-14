@@ -2,11 +2,11 @@
 GraphSSM Time Series Forecasting Evaluation Script
 
 This script is designed to work with the following directory structure:
-- eval_forecasting.py: ~/data/
-- gg_ssms repository: ~/workspace/gg_ssms/
-- ETDataset: ~/data/datasets/ETDataset/
-- Model checkpoints: ~/data/checkpoints/
-- Results: ~/data/results/
+- eval_forecasting.py: /data/
+- gg_ssms repository: /workspace/
+- ETDataset: /data/datasets/ETDataset/
+- Model checkpoints: /data/checkpoints/
+- Results: /data/results/
 
 The script imports GraphSSM from the gg_ssms repository and uses MambaTS
 data providers for time series forecasting evaluation on the ETT dataset.
@@ -27,13 +27,13 @@ from torch.utils.data import DataLoader
 
 # Add MambaTS to path to use their data providers
 # Since eval_forecasting.py is now in ~/data and gg_ssms repo is in ~/workspace
-gg_ssms_path = os.path.expanduser("/workspace/gg_ssms")
+gg_ssms_path = os.path.expanduser("/workspace")
 mamba_ts_path = os.path.join(gg_ssms_path, "MambaTS")
 
 # Check if paths exist and provide helpful error messages
 if not os.path.exists(gg_ssms_path):
     print(f"ERROR: GG_SSMS repository not found at {gg_ssms_path}")
-    print("Please ensure the gg_ssms repository is located at ~/workspace/gg_ssms")
+    print("Please ensure the gg_ssms repository is located at /workspace")
     sys.exit(1)
 
 if not os.path.exists(mamba_ts_path):
