@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 
 # Add MambaTS to path to use their data providers
 # Since eval_forecasting.py is now in ~/data and gg_ssms repo is in ~/workspace
-gg_ssms_path = os.path.expanduser("~/workspace/gg_ssms")
+gg_ssms_path = os.path.expanduser("/workspace/gg_ssms")
 mamba_ts_path = os.path.join(gg_ssms_path, "MambaTS")
 
 # Check if paths exist and provide helpful error messages
@@ -345,7 +345,7 @@ def build_argparser() -> argparse.Namespace:
     
     # Data loader (MambaTS style)
     parser.add_argument("--data", type=str, default="ETTm1", help="dataset type")
-    parser.add_argument("--root_path", type=str, default=os.path.expanduser("~/data/datasets/ETDataset/ETT-small"), help="root path of the data file")
+    parser.add_argument("--root_path", type=str, default=os.path.expanduser("~/data/datasets/ETT-small"), help="root path of the data file")
     parser.add_argument("--data_path", type=str, default="ETTm1.csv", help="data file")
     parser.add_argument("--features", type=str, default="M", help="forecasting task")
     parser.add_argument("--target", type=str, default="OT", help="target feature")
