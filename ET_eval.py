@@ -345,7 +345,7 @@ def build_argparser() -> argparse.Namespace:
     
     # Data loader (MambaTS style)
     parser.add_argument("--data", type=str, default="ETTm1", help="dataset type")
-    parser.add_argument("--root_path", type=str, default=os.path.expanduser("~/data/datasets/ETT-small"), help="root path of the data file")
+    parser.add_argument("--root_path", type=str, default=os.path.expanduser("/data/datasets/ETT-small"), help="root path of the data file")
     parser.add_argument("--data_path", type=str, default="ETTm1.csv", help="data file")
     parser.add_argument("--features", type=str, default="M", help="forecasting task")
     parser.add_argument("--target", type=str, default="OT", help="target feature")
