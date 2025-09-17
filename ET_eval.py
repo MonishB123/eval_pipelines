@@ -17,13 +17,15 @@ import math
 import os
 import random
 import sys
-from typing import Tuple
+import time
+from typing import Tuple, Dict, Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.profiler import profile, record_function, ProfilerActivity
 
 # Add MambaTS to path to use their data providers
 # Since eval_forecasting.py is now in ~/data and gg_ssms repo is in ~/workspace
@@ -58,6 +60,136 @@ from main import GraphSSM
 
 
 # Remove the synthetic dataset class - we'll use MambaTS data providers instead
+
+
+class TFLOPSCalculator:
+    """Utility class for calculating TFLOPS during model inference"""
+    
+    def __init__(self):
+        self.total_flops = 0
+        self.total_time = 0.0
+        self.batch_count = 0
+        self.start_time = None
+        
+    def start_timing(self):
+        """Start timing for a batch"""
+        self.start_time = time.time()
+        
+    def end_timing(self):
+        """End timing for a batch and accumulate time"""
+        if self.start_time is not None:
+            batch_time = time.time() - self.start_time
+            self.total_time += batch_time
+            self.batch_count += 1
+            self.start_time = None
+            return batch_time
+        return 0.0
+    
+    def add_flops(self, flops: int):
+        """Add FLOPs for a batch"""
+        self.total_flops += flops
+        
+    def calculate_tflops(self) -> float:
+        """Calculate TFLOPS from accumulated data"""
+        if self.total_time > 0:
+            return (self.total_flops / 1e12) / self.total_time
+        return 0.0
+    
+    def reset(self):
+        """Reset counters"""
+        self.total_flops = 0
+        self.total_time = 0.0
+        self.batch_count = 0
+        self.start_time = None
+
+
+def count_linear_flops(input_shape: tuple, output_features: int, bias: bool = True) -> int:
+    """Count FLOPs for a linear layer"""
+    batch_size, seq_len, input_features = input_shape
+    # Each output element requires input_features multiplications and additions
+    # Plus bias addition if present
+    flops_per_output = input_features * 2  # multiply + add
+    if bias:
+        flops_per_output += 1  # bias addition
+    
+    total_outputs = batch_size * seq_len * output_features
+    return total_outputs * flops_per_output
+
+
+def count_normalization_flops(input_shape: tuple) -> int:
+    """Count FLOPs for normalization operations"""
+    batch_size, seq_len, features = input_shape
+    # Mean calculation: seq_len additions per feature
+    mean_flops = batch_size * features * seq_len
+    
+    # Variance calculation: (x - mean)^2 for each element
+    variance_flops = batch_size * seq_len * features * 3  # subtract, square, add
+    
+    # Square root: 1 operation per feature
+    sqrt_flops = batch_size * features
+    
+    # Division: 1 operation per element
+    div_flops = batch_size * seq_len * features
+    
+    return mean_flops + variance_flops + sqrt_flops + div_flops
+
+
+def estimate_graphssm_flops(input_shape: tuple, d_model: int, d_state: int, d_conv: int, expand: int) -> int:
+    """Estimate FLOPs for GraphSSM operations"""
+    batch_size, seq_len, _ = input_shape
+    
+    # This is a rough estimate - GraphSSM involves complex operations
+    # We'll estimate based on typical SSM operations
+    
+    # Input projection (if any)
+    input_proj_flops = batch_size * seq_len * d_model * d_model * 2
+    
+    # State space operations (simplified)
+    # Each timestep processes d_state states
+    state_flops = batch_size * seq_len * d_state * d_state * 2
+    
+    # Convolution operations
+    conv_flops = batch_size * seq_len * d_model * d_conv * 2
+    
+    # Output projection
+    output_proj_flops = batch_size * seq_len * d_model * d_model * 2
+    
+    # Expansion factor
+    total_flops = (input_proj_flops + state_flops + conv_flops + output_proj_flops) * expand
+    
+    return int(total_flops)
+
+
+def count_model_flops(model: nn.Module, input_shape: tuple, args: argparse.Namespace) -> int:
+    """Count total FLOPs for the TimeSeriesForecaster model"""
+    batch_size, seq_len, enc_in = input_shape
+    total_flops = 0
+    
+    # Input embedding FLOPs
+    input_embedding_flops = count_linear_flops(input_shape, args.d_model, bias=False)
+    total_flops += input_embedding_flops
+    
+    # Normalization FLOPs (before and after)
+    norm_flops = count_normalization_flops(input_shape) * 2  # normalize + denormalize
+    total_flops += norm_flops
+    
+    # GraphSSM FLOPs (estimated)
+    graphssm_input_shape = (batch_size, seq_len, args.d_model)
+    graphssm_flops = estimate_graphssm_flops(
+        graphssm_input_shape, 
+        args.d_model, 
+        args.d_state, 
+        args.d_conv, 
+        args.expand
+    )
+    total_flops += graphssm_flops
+    
+    # Output projection FLOPs
+    output_shape = (batch_size, args.pred_len, args.d_model)
+    output_proj_flops = count_linear_flops(output_shape, args.c_out, bias=False)
+    total_flops += output_proj_flops
+    
+    return total_flops
 
 
 class TimeSeriesForecaster(nn.Module):
@@ -238,6 +370,13 @@ def inference(args: argparse.Namespace) -> None:
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Using device: {device}")
     
+    # Run detailed profiling if requested
+    if args.profile_detailed:
+        detailed_profiling(model, test_loader, args, device)
+    
+    # Initialize TFLOPS calculator
+    tflops_calc = TFLOPSCalculator()
+    
     # Run inference
     print("\nRunning inference...")
     all_predictions = []
@@ -245,6 +384,21 @@ def inference(args: argparse.Namespace) -> None:
     total_loss = 0.0
     criterion = nn.MSELoss()
     
+    # Warmup runs for accurate timing
+    if args.warmup_batches > 0:
+        print(f"Running {args.warmup_batches} warmup batches...")
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+                if i >= args.warmup_batches:
+                    break
+                batch_x = batch_x.to(device).float()
+                batch_y = batch_y.to(device).float()
+                batch_x_mark = batch_x_mark.to(device).float()
+                batch_y_mark = batch_y_mark.to(device).float()
+                dec_inp = torch.zeros_like(batch_y).float().to(device)
+                _ = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+    
+    # Main inference loop with TFLOPS calculation
     with torch.no_grad():
         for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
             batch_x = batch_x.to(device).float()
@@ -255,8 +409,18 @@ def inference(args: argparse.Namespace) -> None:
             # Create decoder input (zeros for inference)
             dec_inp = torch.zeros_like(batch_y).float().to(device)
             
+            # Start timing for this batch
+            tflops_calc.start_timing()
+            
             # Forward pass
             predictions = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            
+            # End timing for this batch
+            batch_time = tflops_calc.end_timing()
+            
+            # Calculate FLOPs for this batch
+            batch_flops = count_model_flops(model, batch_x.shape, args)
+            tflops_calc.add_flops(batch_flops)
             
             # Extract only the prediction part from batch_y (remove label_len overlap)
             # batch_y contains [label_len + pred_len], we only want the pred_len part
@@ -269,6 +433,8 @@ def inference(args: argparse.Namespace) -> None:
                 print(f"Debug - batch_x shape: {batch_x.shape}")
                 print(f"Debug - batch_y shape (after trim): {batch_y.shape}")
                 print(f"Debug - predictions shape: {predictions.shape}")
+                print(f"Debug - Batch FLOPs: {batch_flops:,}")
+                print(f"Debug - Batch time: {batch_time:.4f}s")
             
             # Calculate loss
             loss = criterion(predictions, batch_y)
@@ -279,9 +445,10 @@ def inference(args: argparse.Namespace) -> None:
             all_targets.append(batch_y.cpu().numpy())
             
             if (i + 1) % 100 == 0:
-                print(f"Processed {i + 1}/{len(test_loader)} batches")
+                current_tflops = tflops_calc.calculate_tflops()
+                print(f"Processed {i + 1}/{len(test_loader)} batches - Current TFLOPS: {current_tflops:.2f}")
     
-    # Calculate metrics
+    # Calculate final metrics
     predictions = np.concatenate(all_predictions, axis=0)
     targets = np.concatenate(all_targets, axis=0)
     
@@ -289,6 +456,11 @@ def inference(args: argparse.Namespace) -> None:
     mse = np.mean((predictions - targets) ** 2)
     rmse = np.sqrt(mse)
     mape = np.mean(np.abs((predictions - targets) / (targets + 1e-8)))
+    
+    # Calculate final TFLOPS
+    final_tflops = tflops_calc.calculate_tflops()
+    avg_batch_time = tflops_calc.total_time / max(tflops_calc.batch_count, 1)
+    total_flops = tflops_calc.total_flops
     
     print("\n" + "=" * 50)
     print("INFERENCE RESULTS")
@@ -300,13 +472,120 @@ def inference(args: argparse.Namespace) -> None:
     print(f"MAPE: {mape:.6f}")
     print("=" * 50)
     
+    print("\n" + "=" * 50)
+    print("PERFORMANCE METRICS")
+    print("=" * 50)
+    print(f"Total FLOPs: {total_flops:,}")
+    print(f"Total time: {tflops_calc.total_time:.4f}s")
+    print(f"Average batch time: {avg_batch_time:.4f}s")
+    print(f"Batches processed: {tflops_calc.batch_count}")
+    print(f"TFLOPS: {final_tflops:.2f}")
+    
+    # GPU utilization estimation
+    if device.type == 'cuda':
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"GPU: {gpu_name}")
+        
+        # Get theoretical peak TFLOPS (rough estimates for common GPUs)
+        gpu_peak_tflops = {
+            'RTX 4090': 83.0,
+            'RTX 4080': 48.7,
+            'RTX 4070': 29.0,
+            'A100': 312.0,
+            'V100': 125.0,
+            'T4': 8.1
+        }
+        
+        peak_tflops = None
+        for gpu_key in gpu_peak_tflops:
+            if gpu_key in gpu_name:
+                peak_tflops = gpu_peak_tflops[gpu_key]
+                break
+        
+        if peak_tflops:
+            utilization = (final_tflops / peak_tflops) * 100
+            print(f"Theoretical peak TFLOPS: {peak_tflops:.1f}")
+            print(f"Utilization: {utilization:.1f}%")
+    
+    print("=" * 50)
+    
     # Save predictions if requested
     if args.save_predictions:
         save_path = f"predictions_{args.data}_seq{args.seq_len}_pred{args.pred_len}.npy"
         np.save(save_path, predictions)
         print(f"Predictions saved to {save_path}")
     
+    # Save performance metrics if requested
+    if args.save_metrics:
+        metrics = {
+            'tflops': final_tflops,
+            'total_flops': total_flops,
+            'total_time': tflops_calc.total_time,
+            'avg_batch_time': avg_batch_time,
+            'batch_count': tflops_calc.batch_count,
+            'mae': mae,
+            'mse': mse,
+            'rmse': rmse,
+            'mape': mape
+        }
+        metrics_path = f"metrics_{args.data}_seq{args.seq_len}_pred{args.pred_len}.npy"
+        np.save(metrics_path, metrics)
+        print(f"Performance metrics saved to {metrics_path}")
+    
     return predictions, targets
+
+
+def detailed_profiling(model: nn.Module, test_loader: DataLoader, args: argparse.Namespace, device: torch.device) -> Dict[str, Any]:
+    """Run detailed profiling with PyTorch profiler for advanced TFLOPS analysis"""
+    print("\n" + "=" * 50)
+    print("DETAILED PROFILING")
+    print("=" * 50)
+    
+    model.eval()
+    profiler_activities = [ProfilerActivity.CPU]
+    if device.type == 'cuda':
+        profiler_activities.append(ProfilerActivity.CUDA)
+    
+    with profile(
+        activities=profiler_activities,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+                if i >= args.profile_steps:
+                    break
+                    
+                batch_x = batch_x.to(device).float()
+                batch_y = batch_y.to(device).float()
+                batch_x_mark = batch_x_mark.to(device).float()
+                batch_y_mark = batch_y_mark.to(device).float()
+                dec_inp = torch.zeros_like(batch_y).float().to(device)
+                
+                with record_function("model_forward"):
+                    predictions = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+    
+    # Analyze profiler results
+    print("Profiler results:")
+    print(prof.key_averages().table(sort_by="cuda_time_total" if device.type == 'cuda' else "cpu_time_total", row_limit=20))
+    
+    # Extract key metrics
+    key_averages = prof.key_averages()
+    total_cuda_time = sum([event.cuda_time_total for event in key_averages if event.cuda_time_total > 0])
+    total_cpu_time = sum([event.cpu_time_total for event in key_averages if event.cpu_time_total > 0])
+    
+    profiling_results = {
+        'total_cuda_time': total_cuda_time,
+        'total_cpu_time': total_cpu_time,
+        'profile_steps': args.profile_steps
+    }
+    
+    print(f"Total CUDA time: {total_cuda_time:.2f}ms")
+    print(f"Total CPU time: {total_cpu_time:.2f}ms")
+    print("=" * 50)
+    
+    return profiling_results
 
 
 def run_example():
@@ -424,6 +703,12 @@ def build_argparser() -> argparse.Namespace:
     parser.add_argument("--save_predictions", action="store_true", help="Save predictions to file")
     parser.add_argument("--mode", type=str, default="inference", choices=["inference", "train", "example"], help="Mode: inference, train, or example")
     parser.add_argument("--example", action="store_true", help="Run simple example like main.py")
+    
+    # TFLOPS profiling specific
+    parser.add_argument("--warmup_batches", type=int, default=5, help="Number of warmup batches for accurate timing")
+    parser.add_argument("--save_metrics", action="store_true", help="Save performance metrics to file")
+    parser.add_argument("--profile_detailed", action="store_true", help="Enable detailed profiling with PyTorch profiler")
+    parser.add_argument("--profile_steps", type=int, default=10, help="Number of steps to profile in detailed mode")
     
     return parser.parse_args()
 
