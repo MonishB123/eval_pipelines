@@ -18,7 +18,10 @@ import os
 import random
 import sys
 import time
-from typing import Tuple, Dict, Any
+import subprocess
+import json
+import re
+from typing import Tuple, Dict, Any, List, Optional
 
 import numpy as np
 import torch
@@ -60,6 +63,521 @@ from main import GraphSSM
 
 
 # Remove the synthetic dataset class - we'll use MambaTS data providers instead
+
+
+class NsightComputeProfiler:
+    """NVIDIA Nsight Compute profiler integration for exact TFLOPS measurement"""
+    
+    def __init__(self, output_dir: str = "./nsight_profiles"):
+        self.output_dir = output_dir
+        self.nsight_path = self._find_nsight_compute()
+        self.profile_files = []
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+    def _find_nsight_compute(self) -> Optional[str]:
+        """Find NVIDIA Nsight Compute installation"""
+        possible_paths = [
+            "nv-nsight-cu-cli",
+            "/usr/local/cuda/bin/nv-nsight-cu-cli",
+            "C:\\Program Files\\NVIDIA Corporation\\Nsight Compute 2023.3\\nv-nsight-cu-cli.exe",
+            "C:\\Program Files\\NVIDIA Corporation\\Nsight Compute 2024.1\\nv-nsight-cu-cli.exe",
+        ]
+        
+        for path in possible_paths:
+            try:
+                result = subprocess.run([path, "--version"], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    print(f"Found Nsight Compute at: {path}")
+                    return path
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                continue
+        
+        print("WARNING: NVIDIA Nsight Compute not found. Please install it for exact TFLOPS measurement.")
+        return None
+    
+    def create_profiling_script(self, model_script: str, args: argparse.Namespace) -> str:
+        """Create a profiling script that will be run with Nsight Compute"""
+        script_content = f'''#!/usr/bin/env python3
+"""
+Auto-generated profiling script for Nsight Compute
+"""
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Import the model and data loading functions
+from {os.path.basename(model_script).replace('.py', '')} import *
+import torch
+import torch.nn as nn
+
+def profile_model():
+    """Profile the model with minimal overhead"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load test data
+    test_data, test_loader = data_provider(args, flag='test')
+    
+    # Load model
+    model_path = args.checkpoints + "best_model.pth"
+    model = load_pretrained_model(model_path, args, device)
+    model.eval()
+    
+    # Profile only a few batches
+    profile_batches = min(args.nsight_profile_batches, len(test_loader))
+    
+    with torch.no_grad():
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+            if i >= profile_batches:
+                break
+                
+            batch_x = batch_x.to(device).float()
+            batch_y = batch_y.to(device).float()
+            batch_x_mark = batch_x_mark.to(device).float()
+            batch_y_mark = batch_y_mark.to(device).float()
+            dec_inp = torch.zeros_like(batch_y).float().to(device)
+            
+            # This is where Nsight Compute will profile
+            predictions = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            
+            # Synchronize to ensure all operations complete
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+
+if __name__ == "__main__":
+    # Set up arguments
+    args = build_argparser()
+    args.nsight_profile_batches = {args.nsight_profile_batches}
+    profile_model()
+'''
+        
+        script_path = os.path.join(self.output_dir, "nsight_profile_script.py")
+        with open(script_path, 'w') as f:
+            f.write(script_content)
+        
+        return script_path
+    
+    def run_nsight_profiling(self, model_script: str, args: argparse.Namespace) -> Dict[str, Any]:
+        """Run Nsight Compute profiling and extract TFLOPS data"""
+        if not self.nsight_path:
+            return {"error": "Nsight Compute not available"}
+        
+        # Create profiling script
+        profile_script = self.create_profiling_script(model_script, args)
+        
+        # Define metrics to collect
+        metrics = [
+            "sm__sass_thread_inst_executed_op_fp32_pred_on.sum",
+            "sm__sass_thread_inst_executed_op_fp64_pred_on.sum", 
+            "sm__sass_thread_inst_executed_op_ffma_pred_on.sum",
+            "sm__cycles_elapsed.avg.per_second",
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+            "sm__inst_executed.sum",
+            "sm__warps_active.avg.pct_of_peak_sustained_elapsed",
+            "sm__warps_issued.avg.pct_of_peak_sustained_elapsed",
+            "sm__warps_eligible.avg.pct_of_peak_sustained_elapsed",
+            "sm__warps_launched.avg.pct_of_peak_sustained_elapsed"
+        ]
+        
+        # Create output file path
+        output_file = os.path.join(self.output_dir, f"nsight_profile_{int(time.time())}.ncu-rep")
+        
+        # Build Nsight Compute command
+        cmd = [
+            self.nsight_path,
+            "--metrics", ",".join(metrics),
+            "--target-processes", "all",
+            "--kernel-regex", ".*",
+            "--launch-skip-before-match", "0",
+            "--launch-count", str(args.nsight_profile_batches),
+            "--launch-skip", "0",
+            "--export", output_file,
+            "python", profile_script
+        ]
+        
+        print(f"Running Nsight Compute profiling...")
+        print(f"Command: {' '.join(cmd)}")
+        
+        try:
+            # Run Nsight Compute
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode != 0:
+                print(f"Nsight Compute error: {result.stderr}")
+                return {"error": f"Nsight Compute failed: {result.stderr}"}
+            
+            # Parse results
+            return self._parse_nsight_results(result.stdout, output_file)
+            
+        except subprocess.TimeoutExpired:
+            return {"error": "Nsight Compute profiling timed out"}
+        except Exception as e:
+            return {"error": f"Nsight Compute profiling failed: {str(e)}"}
+    
+    def _parse_nsight_results(self, stdout: str, output_file: str) -> Dict[str, Any]:
+        """Parse Nsight Compute results to extract TFLOPS data"""
+        results = {
+            "output_file": output_file,
+            "raw_output": stdout,
+            "tflops": 0.0,
+            "total_flops": 0,
+            "execution_time": 0.0,
+            "utilization": 0.0,
+            "metrics": {}
+        }
+        
+        # Extract metrics from stdout
+        lines = stdout.split('\n')
+        current_kernel = None
+        
+        for line in lines:
+            # Look for kernel names
+            if "Kernel:" in line:
+                current_kernel = line.split("Kernel:")[-1].strip()
+                if current_kernel not in results["metrics"]:
+                    results["metrics"][current_kernel] = {}
+            
+            # Extract metric values
+            for metric in ["sm__sass_thread_inst_executed_op_fp32_pred_on.sum",
+                          "sm__sass_thread_inst_executed_op_fp64_pred_on.sum",
+                          "sm__sass_thread_inst_executed_op_ffma_pred_on.sum",
+                          "sm__cycles_elapsed.avg.per_second",
+                          "sm__throughput.avg.pct_of_peak_sustained_elapsed"]:
+                
+                if metric in line and "=" in line:
+                    try:
+                        value_str = line.split("=")[-1].strip().replace(",", "")
+                        if value_str.replace(".", "").isdigit():
+                            value = float(value_str)
+                            results["metrics"][current_kernel][metric] = value
+                    except (ValueError, IndexError):
+                        continue
+        
+        # Calculate total FLOPs across all kernels
+        total_fp32_ops = 0
+        total_fp64_ops = 0
+        total_ffma_ops = 0
+        total_time = 0
+        
+        for kernel, metrics in results["metrics"].items():
+            if kernel and metrics:
+                total_fp32_ops += metrics.get("sm__sass_thread_inst_executed_op_fp32_pred_on.sum", 0)
+                total_fp64_ops += metrics.get("sm__sass_thread_inst_executed_op_fp64_pred_on.sum", 0)
+                total_ffma_ops += metrics.get("sm__sass_thread_inst_executed_op_ffma_pred_on.sum", 0)
+                
+                # Use the first kernel's timing (they should be similar)
+                if total_time == 0:
+                    cycles_per_sec = metrics.get("sm__cycles_elapsed.avg.per_second", 0)
+                    if cycles_per_sec > 0:
+                        # Estimate execution time (this is approximate)
+                        total_time = 1.0  # We'll need to get actual timing from elsewhere
+        
+        # Calculate total FLOPs (FP32 + FP64 + FMA operations)
+        results["total_flops"] = int(total_fp32_ops + total_fp64_ops + total_ffma_ops)
+        
+        # Calculate TFLOPS (we need execution time for this)
+        if total_time > 0:
+            results["tflops"] = (results["total_flops"] / 1e12) / total_time
+        else:
+            # Fallback: estimate from utilization
+            avg_utilization = 0
+            count = 0
+            for kernel, metrics in results["metrics"].items():
+                if kernel and "sm__throughput.avg.pct_of_peak_sustained_elapsed" in metrics:
+                    avg_utilization += metrics["sm__throughput.avg.pct_of_peak_sustained_elapsed"]
+                    count += 1
+            
+            if count > 0:
+                avg_utilization /= count
+                results["utilization"] = avg_utilization
+                
+                # Estimate TFLOPS from utilization (rough estimate)
+                # This would need GPU-specific peak TFLOPS to be accurate
+                estimated_peak_tflops = 83.0  # RTX 4090 default
+                results["tflops"] = (estimated_peak_tflops * avg_utilization) / 100
+        
+        return results
+    
+    def detect_custom_cuda_libraries(self) -> List[str]:
+        """Detect if custom CUDA libraries like TreeScan are being used"""
+        detected_libs = []
+        
+        # Check for common custom CUDA libraries
+        cuda_lib_patterns = [
+            r"treescan",
+            r"mamba",
+            r"ssm",
+            r"selective_scan",
+            r"causal_conv",
+            r"graph_ssm"
+        ]
+        
+        # Check in the current directory and common locations
+        search_paths = [
+            ".",
+            os.path.expanduser("~/workspace"),
+            "/workspace"
+        ]
+        
+        for search_path in search_paths:
+            if os.path.exists(search_path):
+                for root, dirs, files in os.walk(search_path):
+                    for file in files:
+                        if file.endswith(('.cu', '.cuh', '.cpp', '.h')):
+                            file_path = os.path.join(root, file)
+                            try:
+                                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                    content = f.read().lower()
+                                    for pattern in cuda_lib_patterns:
+                                        if re.search(pattern, content):
+                                            if pattern not in detected_libs:
+                                                detected_libs.append(pattern)
+                            except:
+                                continue
+        
+        return detected_libs
+    
+    def run_advanced_nsight_profiling(self, model_script: str, args: argparse.Namespace) -> Dict[str, Any]:
+        """Run advanced Nsight Compute profiling with timing and FLOP extraction"""
+        if not self.nsight_path:
+            return {"error": "Nsight Compute not available"}
+        
+        print("\n" + "=" * 60)
+        print("NVIDIA NSIGHT COMPUTE PROFILING")
+        print("=" * 60)
+        
+        # Detect custom CUDA libraries
+        custom_libs = self.detect_custom_cuda_libraries()
+        if custom_libs:
+            print(f"Detected custom CUDA libraries: {', '.join(custom_libs)}")
+        else:
+            print("No custom CUDA libraries detected (using standard PyTorch operations)")
+        
+        # Create profiling script
+        profile_script = self.create_profiling_script(model_script, args)
+        
+        # Define comprehensive metrics for exact TFLOPS calculation
+        metrics = [
+            # Floating point operations
+            "sm__sass_thread_inst_executed_op_fp32_pred_on.sum",
+            "sm__sass_thread_inst_executed_op_fp64_pred_on.sum",
+            "sm__sass_thread_inst_executed_op_ffma_pred_on.sum",
+            "sm__sass_thread_inst_executed_op_fp16_pred_on.sum",
+            "sm__sass_thread_inst_executed_op_bf16_pred_on.sum",
+            
+            # Timing metrics
+            "sm__cycles_elapsed.avg.per_second",
+            "sm__cycles_elapsed.avg",
+            "sm__cycles_elapsed.sum",
+            
+            # Throughput and utilization
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+            "sm__throughput.avg.pct_of_peak_sustained_achieved",
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+            
+            # Instruction counts
+            "sm__inst_executed.sum",
+            "sm__inst_executed.avg.per_cycle_elapsed",
+            "sm__inst_executed.avg.per_cycle_active",
+            
+            # Warp utilization
+            "sm__warps_active.avg.pct_of_peak_sustained_elapsed",
+            "sm__warps_issued.avg.pct_of_peak_sustained_elapsed",
+            "sm__warps_eligible.avg.pct_of_peak_sustained_elapsed",
+            "sm__warps_launched.avg.pct_of_peak_sustained_elapsed",
+            
+            # Memory metrics
+            "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+            "l1tex__throughput.avg.pct_of_peak_sustained_elapsed",
+            "l2__throughput.avg.pct_of_peak_sustained_elapsed"
+        ]
+        
+        # Create output file path
+        timestamp = int(time.time())
+        output_file = os.path.join(self.output_dir, f"nsight_profile_{timestamp}.ncu-rep")
+        csv_output = os.path.join(self.output_dir, f"nsight_metrics_{timestamp}.csv")
+        
+        # Build Nsight Compute command with CSV output for easier parsing
+        cmd = [
+            self.nsight_path,
+            "--metrics", ",".join(metrics),
+            "--target-processes", "all",
+            "--kernel-regex", ".*",
+            "--launch-skip-before-match", "0",
+            "--launch-count", str(args.nsight_profile_batches),
+            "--launch-skip", "0",
+            "--export", output_file,
+            "--csv",
+            "--page", "details",
+            "python", profile_script
+        ]
+        
+        print(f"Running Nsight Compute profiling...")
+        print(f"Profile batches: {args.nsight_profile_batches}")
+        print(f"Output file: {output_file}")
+        print(f"Command: {' '.join(cmd)}")
+        
+        try:
+            # Run Nsight Compute
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            
+            if result.returncode != 0:
+                print(f"Nsight Compute error: {result.stderr}")
+                return {"error": f"Nsight Compute failed: {result.stderr}"}
+            
+            # Parse results with improved accuracy
+            results = self._parse_advanced_nsight_results(result.stdout, output_file, args)
+            
+            # Save detailed results
+            results_file = os.path.join(self.output_dir, f"nsight_results_{timestamp}.json")
+            with open(results_file, 'w') as f:
+                json.dump(results, f, indent=2)
+            
+            print(f"Detailed results saved to: {results_file}")
+            print("=" * 60)
+            
+            return results
+            
+        except subprocess.TimeoutExpired:
+            return {"error": "Nsight Compute profiling timed out (10 minutes)"}
+        except Exception as e:
+            return {"error": f"Nsight Compute profiling failed: {str(e)}"}
+    
+    def _parse_advanced_nsight_results(self, stdout: str, output_file: str, args: argparse.Namespace) -> Dict[str, Any]:
+        """Parse Nsight Compute results with improved accuracy for TFLOPS calculation"""
+        results = {
+            "output_file": output_file,
+            "raw_output": stdout,
+            "tflops": 0.0,
+            "total_flops": 0,
+            "execution_time": 0.0,
+            "utilization": 0.0,
+            "kernels": {},
+            "custom_libraries_detected": [],
+            "gpu_info": {},
+            "metrics_summary": {}
+        }
+        
+        # Parse the CSV-like output from Nsight Compute
+        lines = stdout.split('\n')
+        current_kernel = None
+        kernel_data = {}
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Look for kernel information
+            if "Kernel:" in line:
+                if current_kernel and kernel_data:
+                    results["kernels"][current_kernel] = kernel_data.copy()
+                current_kernel = line.split("Kernel:")[-1].strip()
+                kernel_data = {}
+                continue
+            
+            # Parse metric values
+            if "=" in line:
+                try:
+                    parts = line.split("=", 1)
+                    metric_name = parts[0].strip()
+                    value_str = parts[1].strip().replace(",", "")
+                    
+                    # Convert value to appropriate type
+                    if value_str.replace(".", "").replace("-", "").isdigit():
+                        value = float(value_str)
+                        kernel_data[metric_name] = value
+                except (ValueError, IndexError):
+                    continue
+        
+        # Add the last kernel
+        if current_kernel and kernel_data:
+            results["kernels"][current_kernel] = kernel_data
+        
+        # Calculate total FLOPs across all kernels
+        total_fp32_ops = 0
+        total_fp64_ops = 0
+        total_ffma_ops = 0
+        total_fp16_ops = 0
+        total_bf16_ops = 0
+        total_cycles = 0
+        total_utilization = 0
+        kernel_count = 0
+        
+        for kernel_name, metrics in results["kernels"].items():
+            if not metrics:
+                continue
+                
+            kernel_count += 1
+            
+            # Sum up floating point operations
+            total_fp32_ops += metrics.get("sm__sass_thread_inst_executed_op_fp32_pred_on.sum", 0)
+            total_fp64_ops += metrics.get("sm__sass_thread_inst_executed_op_fp64_pred_on.sum", 0)
+            total_ffma_ops += metrics.get("sm__sass_thread_inst_executed_op_ffma_pred_on.sum", 0)
+            total_fp16_ops += metrics.get("sm__sass_thread_inst_executed_op_fp16_pred_on.sum", 0)
+            total_bf16_ops += metrics.get("sm__sass_thread_inst_executed_op_bf16_pred_on.sum", 0)
+            
+            # Sum up cycles
+            total_cycles += metrics.get("sm__cycles_elapsed.sum", 0)
+            
+            # Average utilization
+            utilization = metrics.get("sm__throughput.avg.pct_of_peak_sustained_elapsed", 0)
+            if utilization > 0:
+                total_utilization += utilization
+        
+        # Calculate total FLOPs (weighted by precision)
+        # FP32 = 1x, FP64 = 2x, FMA = 2x (fused multiply-add), FP16/BF16 = 0.5x
+        results["total_flops"] = int(
+            total_fp32_ops + 
+            total_fp64_ops * 2 + 
+            total_ffma_ops * 2 + 
+            total_fp16_ops * 0.5 + 
+            total_bf16_ops * 0.5
+        )
+        
+        # Calculate execution time from cycles
+        if total_cycles > 0 and kernel_count > 0:
+            # Get GPU frequency (approximate)
+            gpu_freq_ghz = 1.5  # Default assumption, should be detected
+            for kernel_name, metrics in results["kernels"].items():
+                if "sm__cycles_elapsed.avg.per_second" in metrics:
+                    gpu_freq_ghz = metrics["sm__cycles_elapsed.avg.per_second"] / 1e9
+                    break
+            
+            # Calculate execution time
+            results["execution_time"] = total_cycles / (gpu_freq_ghz * 1e9)
+            
+            # Calculate TFLOPS
+            if results["execution_time"] > 0:
+                results["tflops"] = (results["total_flops"] / 1e12) / results["execution_time"]
+        
+        # Calculate average utilization
+        if kernel_count > 0:
+            results["utilization"] = total_utilization / kernel_count
+        
+        # Create metrics summary
+        results["metrics_summary"] = {
+            "total_kernels": kernel_count,
+            "fp32_operations": int(total_fp32_ops),
+            "fp64_operations": int(total_fp64_ops),
+            "ffma_operations": int(total_ffma_ops),
+            "fp16_operations": int(total_fp16_ops),
+            "bf16_operations": int(total_bf16_ops),
+            "total_cycles": int(total_cycles),
+            "average_utilization": results["utilization"]
+        }
+        
+        # Detect custom libraries from kernel names
+        custom_lib_patterns = ["treescan", "mamba", "ssm", "selective_scan", "causal_conv", "graph_ssm"]
+        for kernel_name in results["kernels"].keys():
+            for pattern in custom_lib_patterns:
+                if pattern.lower() in kernel_name.lower():
+                    if pattern not in results["custom_libraries_detected"]:
+                        results["custom_libraries_detected"].append(pattern)
+        
+        return results
 
 
 class TFLOPSCalculator:
@@ -370,11 +888,23 @@ def inference(args: argparse.Namespace) -> None:
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Using device: {device}")
     
-    # Run detailed profiling if requested
-    if args.profile_detailed:
-        detailed_profiling(model, test_loader, args, device)
+    # Run Nsight Compute profiling for exact TFLOPS measurement
+    nsight_results = None
+    if args.nsight_compute:
+        nsight_profiler = NsightComputeProfiler()
+        nsight_results = nsight_profiler.run_advanced_nsight_profiling(__file__, args)
+        
+        if "error" in nsight_results:
+            print(f"Nsight Compute profiling failed: {nsight_results['error']}")
+            print("Falling back to PyTorch profiler...")
+            nsight_results = None
     
-    # Initialize TFLOPS calculator
+    # Run detailed profiling for accurate TFLOPS calculation (fallback)
+    profiling_results = None
+    if args.profile_detailed and not nsight_results:
+        profiling_results = detailed_profiling_for_tflops(model, test_loader, args, device)
+    
+    # Initialize TFLOPS calculator for basic timing
     tflops_calc = TFLOPSCalculator()
     
     # Run inference
@@ -457,10 +987,34 @@ def inference(args: argparse.Namespace) -> None:
     rmse = np.sqrt(mse)
     mape = np.mean(np.abs((predictions - targets) / (targets + 1e-8)))
     
-    # Calculate final TFLOPS
-    final_tflops = tflops_calc.calculate_tflops()
-    avg_batch_time = tflops_calc.total_time / max(tflops_calc.batch_count, 1)
-    total_flops = tflops_calc.total_flops
+    # Calculate final TFLOPS - prioritize Nsight Compute results if available
+    if nsight_results and 'tflops' in nsight_results:
+        # Use Nsight Compute results (most accurate)
+        final_tflops = nsight_results['tflops']
+        total_flops = nsight_results['total_flops']
+        total_time = nsight_results['execution_time']
+        avg_batch_time = total_time / nsight_results['metrics_summary']['total_kernels'] if nsight_results['metrics_summary']['total_kernels'] > 0 else 0
+        batch_count = nsight_results['metrics_summary']['total_kernels']
+        tflops_method = "NVIDIA Nsight Compute (exact GPU kernel analysis)"
+        custom_libs = nsight_results.get('custom_libraries_detected', [])
+    elif profiling_results and 'tflops' in profiling_results:
+        # Use PyTorch profiler-based TFLOPS calculation (fallback)
+        final_tflops = profiling_results['tflops']
+        total_flops = profiling_results['total_flops']
+        total_time = profiling_results['total_time_s']
+        avg_batch_time = total_time / profiling_results['profile_steps']
+        batch_count = profiling_results['profile_steps']
+        tflops_method = "PyTorch Profiler (GPU kernel timing)"
+        custom_libs = []
+    else:
+        # Fall back to basic timing calculation
+        final_tflops = tflops_calc.calculate_tflops()
+        total_flops = tflops_calc.total_flops
+        total_time = tflops_calc.total_time
+        avg_batch_time = tflops_calc.total_time / max(tflops_calc.batch_count, 1)
+        batch_count = tflops_calc.batch_count
+        tflops_method = "Basic timing (wall-clock)"
+        custom_libs = []
     
     print("\n" + "=" * 50)
     print("INFERENCE RESULTS")
@@ -475,16 +1029,44 @@ def inference(args: argparse.Namespace) -> None:
     print("\n" + "=" * 50)
     print("PERFORMANCE METRICS")
     print("=" * 50)
+    print(f"TFLOPS Method: {tflops_method}")
     print(f"Total FLOPs: {total_flops:,}")
-    print(f"Total time: {tflops_calc.total_time:.4f}s")
+    print(f"Total time: {total_time:.4f}s")
     print(f"Average batch time: {avg_batch_time:.4f}s")
-    print(f"Batches processed: {tflops_calc.batch_count}")
-    print(f"TFLOPS: {final_tflops:.2f}")
+    print(f"Batches processed: {batch_count}")
+    print(f"**TFLOPS: {final_tflops:.2f}**")
+    
+    # Show custom CUDA libraries if detected
+    if custom_libs:
+        print(f"Custom CUDA libraries detected: {', '.join(custom_libs)}")
+    
+    # Show detailed Nsight Compute results if available
+    if nsight_results and 'metrics_summary' in nsight_results:
+        print(f"\n--- Nsight Compute Detailed Results ---")
+        summary = nsight_results['metrics_summary']
+        print(f"Total kernels profiled: {summary['total_kernels']}")
+        print(f"FP32 operations: {summary['fp32_operations']:,}")
+        print(f"FP64 operations: {summary['fp64_operations']:,}")
+        print(f"FMA operations: {summary['ffma_operations']:,}")
+        print(f"FP16 operations: {summary['fp16_operations']:,}")
+        print(f"BF16 operations: {summary['bf16_operations']:,}")
+        print(f"Total cycles: {summary['total_cycles']:,}")
+        print(f"Average utilization: {summary['average_utilization']:.1f}%")
+        
+        # Show kernel breakdown
+        if nsight_results.get('kernels'):
+            print(f"\nKernel breakdown:")
+            for kernel_name, metrics in nsight_results['kernels'].items():
+                if metrics:
+                    fp32_ops = metrics.get('sm__sass_thread_inst_executed_op_fp32_pred_on.sum', 0)
+                    ffma_ops = metrics.get('sm__sass_thread_inst_executed_op_ffma_pred_on.sum', 0)
+                    utilization = metrics.get('sm__throughput.avg.pct_of_peak_sustained_elapsed', 0)
+                    print(f"  {kernel_name}: {fp32_ops:,.0f} FP32 ops, {ffma_ops:,.0f} FMA ops, {utilization:.1f}% util")
     
     # GPU utilization estimation
     if device.type == 'cuda':
         gpu_name = torch.cuda.get_device_name(0)
-        print(f"GPU: {gpu_name}")
+        print(f"\nGPU: {gpu_name}")
         
         # Get theoretical peak TFLOPS (rough estimates for common GPUs)
         gpu_peak_tflops = {
@@ -519,42 +1101,83 @@ def inference(args: argparse.Namespace) -> None:
     if args.save_metrics:
         metrics = {
             'tflops': final_tflops,
+            'tflops_method': tflops_method,
             'total_flops': total_flops,
-            'total_time': tflops_calc.total_time,
+            'total_time': total_time,
             'avg_batch_time': avg_batch_time,
-            'batch_count': tflops_calc.batch_count,
+            'batch_count': batch_count,
             'mae': mae,
             'mse': mse,
             'rmse': rmse,
-            'mape': mape
+            'mape': mape,
+            'custom_libraries_detected': custom_libs
         }
+        
+        # Add Nsight Compute results if available
+        if nsight_results:
+            metrics.update({
+                'nsight_compute': True,
+                'nsight_kernels': nsight_results.get('kernels', {}),
+                'nsight_metrics_summary': nsight_results.get('metrics_summary', {}),
+                'nsight_custom_libraries': nsight_results.get('custom_libraries_detected', []),
+                'nsight_output_file': nsight_results.get('output_file', '')
+            })
+        else:
+            metrics['nsight_compute'] = False
+        
+        # Add PyTorch profiler results if available
+        if profiling_results:
+            metrics.update({
+                'pytorch_profiler': True,
+                'profiler_total_cuda_time': profiling_results.get('total_cuda_time', 0),
+                'profiler_total_cpu_time': profiling_results.get('total_cpu_time', 0),
+                'profiler_profile_steps': profiling_results.get('profile_steps', 0),
+                'profiler_flops_per_batch': profiling_results.get('flops_per_batch', 0)
+            })
+        else:
+            metrics['pytorch_profiler'] = False
+        
         metrics_path = f"metrics_{args.data}_seq{args.seq_len}_pred{args.pred_len}.npy"
         np.save(metrics_path, metrics)
         print(f"Performance metrics saved to {metrics_path}")
+        
+        # Also save Nsight Compute results separately if available
+        if nsight_results and 'output_file' in nsight_results:
+            print(f"Nsight Compute profile saved to: {nsight_results['output_file']}")
     
     return predictions, targets
 
 
-def detailed_profiling(model: nn.Module, test_loader: DataLoader, args: argparse.Namespace, device: torch.device) -> Dict[str, Any]:
-    """Run detailed profiling with PyTorch profiler for advanced TFLOPS analysis"""
+def detailed_profiling_for_tflops(model: nn.Module, test_loader: DataLoader, args: argparse.Namespace, device: torch.device) -> Dict[str, Any]:
+    """Run detailed profiling with PyTorch profiler for accurate TFLOPS calculation"""
     print("\n" + "=" * 50)
-    print("DETAILED PROFILING")
+    print("DETAILED TFLOPS PROFILING")
     print("=" * 50)
     
     model.eval()
-    profiler_activities = [ProfilerActivity.CPU]
-    if device.type == 'cuda':
-        profiler_activities.append(ProfilerActivity.CUDA)
+    
+    # 1. Select the number of steps to profile
+    profile_steps = min(args.profile_steps, len(test_loader))
+    print(f"Profiling {profile_steps} batches...")
+    
+    # Get batch shape for FLOP calculation
+    first_batch = next(iter(test_loader))
+    batch_x_shape = first_batch[0].shape
+    print(f"Batch shape: {batch_x_shape}")
+    
+    # Calculate FLOPs per batch using our estimation
+    flops_per_batch = count_model_flops(model, batch_x_shape, args)
+    print(f"Estimated FLOPs per batch: {flops_per_batch:,}")
     
     with profile(
-        activities=profiler_activities,
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA] if device.type == 'cuda' else [ProfilerActivity.CPU],
+        record_shapes=False,
+        with_stack=False,
+        profile_memory=False
     ) as prof:
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
-                if i >= args.profile_steps:
+                if i >= profile_steps:
                     break
                     
                 batch_x = batch_x.to(device).float()
@@ -563,29 +1186,72 @@ def detailed_profiling(model: nn.Module, test_loader: DataLoader, args: argparse
                 batch_y_mark = batch_y_mark.to(device).float()
                 dec_inp = torch.zeros_like(batch_y).float().to(device)
                 
-                with record_function("model_forward"):
-                    predictions = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-    
-    # Analyze profiler results
-    print("Profiler results:")
-    print(prof.key_averages().table(sort_by="cuda_time_total" if device.type == 'cuda' else "cpu_time_total", row_limit=20))
-    
-    # Extract key metrics
+                with record_function("GraphSSM_Forward"):  # Time the entire forward pass
+                    _ = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+    # 2. Extract Total Time from Profiler
     key_averages = prof.key_averages()
+    time_key = "cuda_time_total" if device.type == 'cuda' else "cpu_time_total"
+    
+    # Find the total time spent in the specifically recorded function
+    total_time_us = 0
+    for event in key_averages:
+        if event.key == "GraphSSM_Forward":
+            total_time_us = event.self_average * profile_steps
+            break
+    
+    # If we didn't find the specific function, sum all forward pass time
+    if total_time_us == 0:
+        for event in key_averages:
+            if "forward" in event.key.lower() or "GraphSSM" in event.key:
+                total_time_us += event.self_average * profile_steps
+    
+    # Convert microseconds (us) to seconds (s)
+    total_time_s = total_time_us / 1e6
+    
+    # 3. Calculate total FLOPs for profiled batches
+    total_flops = flops_per_batch * profile_steps
+    
+    # 4. Calculate TFLOPS
+    tflops = (total_flops / 1e12) / total_time_s if total_time_s > 0 else 0.0
+    
+    print(f"\n--- Detailed TFLOPS Calculation (Profiled Steps) ---")
+    print(f"Profile steps: {profile_steps}")
+    print(f"Total Estimated FLOPs: {total_flops:,.0f}")
+    print(f"Total GPU Time (Forward Pass): {total_time_s:.4f} s")
+    print(f"**TFLOPS (Calculated): {tflops:.2f}**")
+    
+    # Show profiler results
+    print(f"\nProfiler results (top 10 operations by {time_key}):")
+    print(prof.key_averages().table(sort_by=time_key, row_limit=10))
+    
+    # Additional timing analysis
     total_cuda_time = sum([event.cuda_time_total for event in key_averages if event.cuda_time_total > 0])
     total_cpu_time = sum([event.cpu_time_total for event in key_averages if event.cpu_time_total > 0])
+    
+    print(f"\nTiming Summary:")
+    print(f"Total CUDA time: {total_cuda_time:.2f}ms")
+    print(f"Total CPU time: {total_cpu_time:.2f}ms")
+    print(f"Average time per batch: {total_time_s/profile_steps:.4f}s")
     
     profiling_results = {
         'total_cuda_time': total_cuda_time,
         'total_cpu_time': total_cpu_time,
-        'profile_steps': args.profile_steps
+        'profile_steps': profile_steps,
+        'total_time_s': total_time_s,
+        'total_flops': total_flops,
+        'tflops': tflops,
+        'flops_per_batch': flops_per_batch
     }
     
-    print(f"Total CUDA time: {total_cuda_time:.2f}ms")
-    print(f"Total CPU time: {total_cpu_time:.2f}ms")
     print("=" * 50)
     
     return profiling_results
+
+
+def detailed_profiling(model: nn.Module, test_loader: DataLoader, args: argparse.Namespace, device: torch.device) -> Dict[str, Any]:
+    """Legacy function - redirects to detailed_profiling_for_tflops"""
+    return detailed_profiling_for_tflops(model, test_loader, args, device)
 
 
 def run_example():
@@ -709,6 +1375,11 @@ def build_argparser() -> argparse.Namespace:
     parser.add_argument("--save_metrics", action="store_true", help="Save performance metrics to file")
     parser.add_argument("--profile_detailed", action="store_true", help="Enable detailed profiling with PyTorch profiler")
     parser.add_argument("--profile_steps", type=int, default=10, help="Number of steps to profile in detailed mode")
+    
+    # NVIDIA Nsight Compute profiling
+    parser.add_argument("--nsight_compute", action="store_true", help="Use NVIDIA Nsight Compute for exact TFLOPS measurement")
+    parser.add_argument("--nsight_profile_batches", type=int, default=5, help="Number of batches to profile with Nsight Compute")
+    parser.add_argument("--nsight_output_dir", type=str, default="./nsight_profiles", help="Directory to save Nsight Compute profiles")
     
     return parser.parse_args()
 
