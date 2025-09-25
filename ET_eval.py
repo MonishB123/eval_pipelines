@@ -30,36 +30,73 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.profiler import profile, record_function, ProfilerActivity
 
-# Add MambaTS to path to use their data providers
-# Since eval_forecasting.py is now in ~/data and gg_ssms repo is in ~/workspace
-gg_ssms_path = os.path.expanduser("/workspace")
-mamba_ts_path = os.path.join(gg_ssms_path, "MambaTS")
+# Global variables for paths - will be set by setup_paths function
+gg_ssms_path = None
+mamba_ts_path = None
 
-# Check if paths exist and provide helpful error messages
-if not os.path.exists(gg_ssms_path):
-    print(f"ERROR: GG_SSMS repository not found at {gg_ssms_path}")
-    print("Please ensure the gg_ssms repository is located at /workspace")
-    sys.exit(1)
 
-if not os.path.exists(mamba_ts_path):
-    print(f"ERROR: MambaTS not found at {mamba_ts_path}")
-    print("Please ensure MambaTS is located in the gg_ssms repository")
-    sys.exit(1)
-
-sys.path.append(mamba_ts_path)
-
-from data_provider.data_factory import data_provider
-from utils.tools import set_seed
-
-# Import GraphSSM directly from main.py in the gg_ssms repo
-main_py_path = os.path.join(gg_ssms_path, "core", "graph_ssm", "main.py")
-if not os.path.exists(main_py_path):
-    print(f"ERROR: main.py not found at {main_py_path}")
-    print("Please ensure the core/graph_ssm/main.py file exists in the gg_ssms repository")
-    sys.exit(1)
-
-sys.path.append(os.path.join(gg_ssms_path, "core", "graph_ssm"))
-from main import GraphSSM
+def setup_paths(workspace_path: str) -> None:
+    """Setup paths for gg_ssms repository and MambaTS based on workspace argument"""
+    global gg_ssms_path, mamba_ts_path
+    
+    # Expand user path and resolve absolute path
+    gg_ssms_path = os.path.expanduser(workspace_path)
+    gg_ssms_path = os.path.abspath(gg_ssms_path)
+    mamba_ts_path = os.path.join(gg_ssms_path, "MambaTS")
+    
+    # Check if paths exist and provide helpful error messages
+    if not os.path.exists(gg_ssms_path):
+        print(f"ERROR: GG_SSMS repository not found at {gg_ssms_path}")
+        print(f"Please ensure the gg_ssms repository is located at {workspace_path}")
+        print("You can specify a different workspace path using --workspace argument")
+        sys.exit(1)
+    
+    if not os.path.exists(mamba_ts_path):
+        print(f"ERROR: MambaTS not found at {mamba_ts_path}")
+        print("Please ensure MambaTS is located in the gg_ssms repository")
+        sys.exit(1)
+    
+    # Add MambaTS to path
+    sys.path.append(mamba_ts_path)
+    
+    # Import MambaTS modules
+    try:
+        from data_provider.data_factory import data_provider
+        from utils.tools import set_seed
+        globals()['data_provider'] = data_provider
+        globals()['set_seed'] = set_seed
+    except ImportError as e:
+        print(f"ERROR: Failed to import MambaTS modules: {e}")
+        print(f"Please ensure MambaTS is properly installed in {mamba_ts_path}")
+        sys.exit(1)
+    
+    # Import GraphSSM from the graph_ssm package
+    graph_ssm_path = os.path.join(gg_ssms_path, "core", "graph_ssm")
+    main_py_path = os.path.join(graph_ssm_path, "main.py")
+    if not os.path.exists(main_py_path):
+        print(f"ERROR: main.py not found at {main_py_path}")
+        print("Please ensure the core/graph_ssm/main.py file exists in the gg_ssms repository")
+        sys.exit(1)
+    
+    # Add the core directory to path so we can import graph_ssm as a package
+    core_path = os.path.join(gg_ssms_path, "core")
+    if core_path not in sys.path:
+        sys.path.insert(0, core_path)
+    
+    # Add the third-party directory to path for tree_scan_lan
+    third_party_path = os.path.join(graph_ssm_path, "third-party", "TreeScanLan")
+    if third_party_path not in sys.path:
+        sys.path.insert(0, third_party_path)
+    
+    try:
+        # Import as a package to handle relative imports correctly
+        from graph_ssm.main import GraphSSM
+        globals()['GraphSSM'] = GraphSSM
+    except ImportError as e:
+        print(f"ERROR: Failed to import GraphSSM: {e}")
+        print(f"Please ensure GraphSSM is properly implemented in {main_py_path}")
+        print("Make sure all dependencies (tree_utils, tree_scan_lan) are available")
+        sys.exit(1)
 
 
 # Remove the synthetic dataset class - we'll use MambaTS data providers instead
@@ -863,13 +900,37 @@ def load_pretrained_model(model_path: str, args: argparse.Namespace, device: tor
     return model
 
 
+def configure_dataset_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Configure dataset-specific arguments based on the dataset type"""
+    if args.data == "Solar" or args.use_solar:
+        # Configure solar dataset parameters
+        args.data = "Solar"  # Ensure data type is set correctly
+        args.root_path = args.solar_root_path
+        args.data_path = args.solar_data_path
+        args.features = "M"  # Multi-variate forecasting
+        args.target = "OT"  # Default target (will be ignored for Solar)
+        args.freq = "t"  # Default frequency
+        args.enc_in = 137  # Solar dataset has 137 features
+        args.dec_in = 137
+        args.c_out = 137
+        print(f"Configured for Solar dataset:")
+        print(f"  Root path: {args.root_path}")
+        print(f"  Data path: {args.data_path}")
+        print(f"  Features: {args.features}")
+        print(f"  Input dimensions: {args.enc_in}")
+    return args
+
+
 def inference(args: argparse.Namespace) -> None:
-    """Run inference on ETT dataset using pre-trained GraphSSM model"""
+    """Run inference on dataset using pre-trained GraphSSM model"""
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     
+    # Configure dataset-specific arguments
+    args = configure_dataset_args(args)
+    
     print("=" * 50)
-    print("GraphSSM Inference on ETT Dataset")
+    print(f"GraphSSM Inference on {args.data} Dataset")
     print("=" * 50)
     
     # Load test data
@@ -1279,7 +1340,27 @@ def run_example():
 
 
 def build_argparser() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate core/graph_ssm on MambaTS time series forecasting")
+    parser = argparse.ArgumentParser(
+        description="Evaluate core/graph_ssm on MambaTS time series forecasting",
+        epilog="""
+Examples:
+  # Run on ETT dataset (default)
+  python ET_eval.py --mode inference
+
+  # Run on Solar dataset
+  python ET_eval.py --mode inference --use_solar
+
+  # Run with custom workspace directory
+  python ET_eval.py --mode inference --workspace /path/to/gg_ssms
+
+  # Run on Solar dataset with custom paths
+  python ET_eval.py --mode inference --data Solar --solar_root_path /path/to/solar --solar_data_path solar_AL.txt
+
+  # Run with profiling and custom workspace
+  python ET_eval.py --mode inference --use_solar --profile_detailed --nsight_compute --workspace /home/user/gg_ssms
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     
     # Basic config (MambaTS style)
     parser.add_argument("--task_name", type=str, default="long_term_forecast", help="task name")
@@ -1290,14 +1371,23 @@ def build_argparser() -> argparse.Namespace:
     
     # Data loader (MambaTS style)
     parser.add_argument("--data", type=str, default="ETTm1", help="dataset type")
-    parser.add_argument("--root_path", type=str, default=os.path.expanduser("/data/eval_pipelines/datasets/ETT-small"), help="root path of the data file")
+    parser.add_argument("--root_path", type=str, default="/data/eval_pipelines/datasets/ETT-small", help="root path of the data file")
     parser.add_argument("--data_path", type=str, default="ETTm1.csv", help="data file")
     parser.add_argument("--features", type=str, default="M", help="forecasting task")
     parser.add_argument("--target", type=str, default="OT", help="target feature")
     parser.add_argument("--freq", type=str, default="t", help="freq for time features encoding")
-    parser.add_argument("--checkpoints", type=str, default=os.path.expanduser("~/data/checkpoints/"), help="location of model checkpoints")
-    parser.add_argument("--visualization", type=str, default=os.path.expanduser("~/data/test_results"), help="location of model checkpoints")
-    parser.add_argument("--results", type=str, default=os.path.expanduser("~/data/results"), help="location of model checkpoints")
+    
+    # Workspace and repository configuration
+    parser.add_argument("--workspace", type=str, default="/workspace", 
+                       help="path to workspace directory containing gg_ssms repository (default: /workspace). "
+                            "This directory should contain the gg_ssms folder with MambaTS and core/graph_ssm subdirectories.")
+    
+    # Solar dataset specific configuration
+    parser.add_argument("--solar_root_path", type=str, default="/data/eval_pipelines/datasets/Solar", help="root path for solar dataset")
+    parser.add_argument("--solar_data_path", type=str, default="solar_AL.txt", help="solar dataset file")
+    parser.add_argument("--checkpoints", type=str, default="/data/checkpoints/", help="location of model checkpoints")
+    parser.add_argument("--visualization", type=str, default="/data/test_results", help="location of model checkpoints")
+    parser.add_argument("--results", type=str, default="/data/results", help="location of model checkpoints")
     
     # Forecasting task
     parser.add_argument("--seq_len", type=int, default=48, help="input sequence length")
@@ -1312,6 +1402,9 @@ def build_argparser() -> argparse.Namespace:
     parser.add_argument("--enc_in", type=int, default=7, help="encoder input size")
     parser.add_argument("--dec_in", type=int, default=7, help="decoder input size")
     parser.add_argument("--c_out", type=int, default=7, help="output size")
+    
+    # Dataset selection
+    parser.add_argument("--use_solar", action="store_true", help="Use Solar dataset instead of ETT")
     parser.add_argument("--d_model", type=int, default=512, help="dimension of model")
     parser.add_argument("--n_heads", type=int, default=8, help="num of heads")
     parser.add_argument("--e_layers", type=int, default=2, help="num of encoder layers")
@@ -1365,7 +1458,7 @@ def build_argparser() -> argparse.Namespace:
     parser.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available")
     
     # Inference specific
-    parser.add_argument("--model_path", type=str, default=os.path.expanduser("~/data/checkpoints/best_model.pth"), help="Path to pre-trained model")
+    parser.add_argument("--model_path", type=str, default="/data/checkpoints/best_model.pth", help="Path to pre-trained model")
     parser.add_argument("--save_predictions", action="store_true", help="Save predictions to file")
     parser.add_argument("--mode", type=str, default="inference", choices=["inference", "train", "example"], help="Mode: inference, train, or example")
     parser.add_argument("--example", action="store_true", help="Run simple example like main.py")
@@ -1388,6 +1481,9 @@ if __name__ == "__main__":
     # Parse arguments
     args = build_argparser()
     
+    # Setup paths based on workspace argument
+    setup_paths(args.workspace)
+    
     # Set random seed for reproducibility
     set_seed(args.seed)
     
@@ -1395,19 +1491,29 @@ if __name__ == "__main__":
     print("GraphSSM Time Series Forecasting")
     print("=" * 60)
     print(f"Mode: {args.mode.upper()}")
+    print(f"Workspace: {gg_ssms_path}")
     print(f"Dataset: {args.data}")
     print(f"Data path: {os.path.join(args.root_path, args.data_path)}")
     print(f"Sequence length: {args.seq_len}, Prediction length: {args.pred_len}")
     print(f"Model: {args.model}")
     print("=" * 60)
     
+    # Configure dataset-specific arguments
+    args = configure_dataset_args(args)
+    
     # Check if data file exists
     data_file_path = os.path.join(args.root_path, args.data_path)
     if not os.path.exists(data_file_path):
         print(f"ERROR: Data file not found at {data_file_path}")
-        print("Please download the ETT dataset and place it in the correct location.")
-        print("Download from: https://github.com/zhouhaoyi/ETDataset")
-        print("Place the ETT-small folder in ~/data/datasets/ETDataset/")
+        if args.data == "Solar":
+            print("Please download the Solar dataset and place it in the correct location.")
+            print("The Solar dataset should be a .txt file with comma-separated values.")
+            print("Expected format: solar_AL.txt with 137 features per timestep.")
+            print(f"Place the solar dataset in: {args.root_path}")
+        else:
+            print("Please download the ETT dataset and place it in the correct location.")
+            print("Download from: https://github.com/zhouhaoyi/ETDataset")
+            print("Place the ETT-small folder in ~/data/datasets/ETDataset/")
         exit(1)
     
     # Run based on mode
