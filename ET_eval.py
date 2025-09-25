@@ -1014,7 +1014,7 @@ def inference(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     
     # Device selection with CUDA error handling
-    if args.cpu:
+    if args.cpu or args.force_cpu:
         device = torch.device("cpu")
         print("Using CPU as requested")
     elif torch.cuda.is_available():
@@ -1062,14 +1062,25 @@ def inference(args: argparse.Namespace) -> None:
             test_output = model_cpu(test_input, test_x_mark, test_dec, test_y_mark)
         print(f"CPU test successful: input {test_input.shape} -> output {test_output.shape}")
         
-        # Move model back to target device
-        model = model.to(device)
-        print(f"Model moved to {device}")
+        # Move model back to target device with error handling
+        try:
+            model = model.to(device)
+            print(f"Model moved to {device}")
+        except RuntimeError as e:
+            if "CUDA" in str(e):
+                print(f"CUDA error when moving model to GPU: {e}")
+                print("The GraphSSM model contains CUDA kernels that are causing memory issues.")
+                print("Falling back to CPU execution...")
+                device = torch.device("cpu")
+                model = model.cpu()  # Model is already on CPU
+                print("Continuing with CPU execution")
+            else:
+                raise
         
     except Exception as e:
         print(f"CPU test failed: {e}")
         print("This suggests the issue is in the model architecture, not CUDA-specific")
-        return
+        return None, None
     
     # Clear CUDA cache before starting inference
     if device.type == 'cuda':
@@ -1551,6 +1562,12 @@ Examples:
 
   # Run with profiling and custom workspace
   python ET_eval.py --mode inference --use_solar --profile_detailed --nsight_compute --workspace /home/user/gg_ssms
+
+  # Run on CPU to avoid GraphSSM CUDA issues
+  python ET_eval.py --mode inference --force_cpu --workspace workspace
+
+  # Run with CPU fallback if CUDA fails
+  python ET_eval.py --mode inference --fallback_cpu --workspace workspace
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1636,6 +1653,8 @@ Examples:
     parser.add_argument("--use_multi_gpu", action="store_true", help="use multiple gpus", default=False)
     parser.add_argument("--devices", type=str, default="0,1,2,3", help="device ids of multile gpus")
     parser.add_argument("--fallback_cpu", action="store_true", help="fallback to CPU if CUDA fails", default=False)
+    parser.add_argument("--force_cpu", action="store_true", 
+                       help="force CPU execution (recommended for GraphSSM due to CUDA kernel memory issues)", default=False)
     
     # De-stationary projector params
     parser.add_argument("--p_hidden_dims", type=int, nargs="+", default=[128, 128], help="hidden layer dimensions of projector")
@@ -1717,8 +1736,12 @@ if __name__ == "__main__":
             run_example()
         else:
             print("\nStarting inference...")
-            predictions, targets = inference(args)
-            print("\nInference completed!")
+            result = inference(args)
+            if result is not None:
+                predictions, targets = result
+                print("\nInference completed!")
+            else:
+                print("\nInference failed - see error messages above.")
     else:
         print("\nStarting training...")
         # Note: Training function would need to be re-added if needed
