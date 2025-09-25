@@ -793,62 +793,20 @@ class TimeSeriesForecaster(nn.Module):
         # x_enc: [B, seq_len, enc_in]
         b, seq_len, enc_in = x_enc.shape
         
-        # Debug information
-        if not hasattr(self, '_forward_debug_count'):
-            self._forward_debug_count = 0
-        self._forward_debug_count += 1
-        
-        if self._forward_debug_count <= 3:
-            print(f"Forward pass {self._forward_debug_count}: Input shape: {x_enc.shape}")
-            print(f"Forward pass {self._forward_debug_count}: Device: {x_enc.device}")
-        
-        try:
-            # Normalize (similar to MambaTS)
-            means = x_enc.mean(1, keepdim=True).detach()
-            x_enc = x_enc - means
-            stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
-            x_enc /= stdev
-            
-            # Ensure tensors are contiguous to avoid CUDA memory issues
-            means = means.contiguous()
-            stdev = stdev.contiguous()
-            
-            if self._forward_debug_count <= 3:
-                print(f"Forward pass {self._forward_debug_count}: Normalization completed")
-                
-        except RuntimeError as e:
-            print(f"Error in normalization step: {e}")
-            print(f"Input tensor info: shape={x_enc.shape}, device={x_enc.device}, dtype={x_enc.dtype}")
-            raise
+        # Normalize (similar to MambaTS)
+        means = x_enc.mean(1, keepdim=True).detach()
+        x_enc = x_enc - means
+        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
+        x_enc /= stdev
         
         # Embed input features: [B, seq_len, enc_in] -> [B, seq_len, d_model]
-        try:
-            embedded = self.input_embedding(x_enc)
-            if self._forward_debug_count <= 3:
-                print(f"Forward pass {self._forward_debug_count}: Embedding completed, shape: {embedded.shape}")
-        except RuntimeError as e:
-            print(f"Error in embedding step: {e}")
-            print(f"Input tensor info: shape={x_enc.shape}, device={x_enc.device}, dtype={x_enc.dtype}")
-            raise
+        embedded = self.input_embedding(x_enc)
         
         # Pass through GraphSSM following the pattern from main.py
         # The main.py example shows: output = model(x, context_len)
         # where x is [batch_size, seq_len, d_model] and context_len is an integer
-        try:
-            context_len = min(seq_len, 4)  # Use a reasonable context length like in main.py example
-            if self._forward_debug_count <= 3:
-                print(f"Forward pass {self._forward_debug_count}: Calling GraphSSM with context_len={context_len}")
-            
-            processed = self.graph_ssm(embedded, context_len)
-            
-            if self._forward_debug_count <= 3:
-                print(f"Forward pass {self._forward_debug_count}: GraphSSM completed, shape: {processed.shape}")
-                
-        except RuntimeError as e:
-            print(f"Error in GraphSSM step: {e}")
-            print(f"Embedded tensor info: shape={embedded.shape}, device={embedded.device}, dtype={embedded.dtype}")
-            print(f"Context len: {context_len}")
-            raise
+        context_len = min(seq_len, 4)  # Use a reasonable context length like in main.py example
+        processed = self.graph_ssm(embedded, context_len)
         
         # Take only the last pred_len timesteps for prediction
         # This ensures we predict the future, not the past
@@ -863,55 +821,9 @@ class TimeSeriesForecaster(nn.Module):
         # Project to output: [B, pred_len, d_model] -> [B, pred_len, c_out]
         output = self.output_projection(processed)
         
-        # De-normalize (optional - skip if dimensions don't match or CUDA errors occur)
-        # stdev and means have shape [B, 1, enc_in], output has shape [B, pred_len, c_out]
-        try:
-            # Only attempt denormalization if dimensions are compatible
-            if (stdev.shape[-1] == output.shape[-1] or 
-                stdev.shape[-1] == 1 or 
-                stdev.shape[-1] <= output.shape[-1]):
-                
-                # Debug information (only first few times)
-                if hasattr(self, '_debug_count'):
-                    self._debug_count += 1
-                else:
-                    self._debug_count = 1
-                
-                if self._debug_count <= 3:
-                    print(f"Debug {self._debug_count}: stdev.shape={stdev.shape}, output.shape={output.shape}")
-                    print(f"Debug {self._debug_count}: means.shape={means.shape}, pred_len={self.pred_len}")
-                
-                if stdev.shape[-1] == output.shape[-1]:
-                    # Perfect match: use stdev and means directly
-                    stdev_repeated = stdev.repeat(1, self.pred_len, 1)
-                    means_repeated = means.repeat(1, self.pred_len, 1)
-                    output = output * stdev_repeated + means_repeated
-                elif stdev.shape[-1] == 1:
-                    # Single feature: broadcast to all output features
-                    stdev_repeated = stdev.repeat(1, self.pred_len, output.shape[-1])
-                    means_repeated = means.repeat(1, self.pred_len, output.shape[-1])
-                    output = output * stdev_repeated + means_repeated
-                else:
-                    # Partial match: only denormalize matching features
-                    min_features = min(stdev.shape[-1], output.shape[-1])
-                    stdev_slice = stdev[:, :, :min_features].repeat(1, self.pred_len, 1)
-                    means_slice = means[:, :, :min_features].repeat(1, self.pred_len, 1)
-                    output[:, :, :min_features] = (output[:, :, :min_features] * stdev_slice + 
-                                                   means_slice)
-            else:
-                # Dimensions incompatible - skip denormalization
-                if not hasattr(self, '_denorm_warning_shown'):
-                    print(f"Warning: Skipping denormalization - incompatible dimensions: "
-                          f"stdev.shape={stdev.shape}, output.shape={output.shape}")
-                    self._denorm_warning_shown = True
-                
-        except RuntimeError as e:
-            # If there's still a CUDA error, skip denormalization
-            if not hasattr(self, '_cuda_error_shown'):
-                print(f"Warning: Skipping denormalization due to CUDA error: {e}")
-                print(f"stdev.shape: {stdev.shape}, output.shape: {output.shape}")
-                self._cuda_error_shown = True
-            pass
+        # De-normalize
+        output = output * (stdev[:, [0], :].repeat(1, self.pred_len, 1))
+        output = output + (means[:, [0], :].repeat(1, self.pred_len, 1))
         
         return output
 
@@ -1012,17 +924,7 @@ def configure_dataset_args(args: argparse.Namespace) -> argparse.Namespace:
 def inference(args: argparse.Namespace) -> None:
     """Run inference on dataset using pre-trained GraphSSM model"""
     set_seed(args.seed)
-    
-    # Device selection with CUDA error handling
-    if args.cpu or args.force_cpu:
-        device = torch.device("cpu")
-        print("Using CPU as requested")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("CUDA is available, using GPU")
-    else:
-        device = torch.device("cpu")
-        print("CUDA not available, using CPU")
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     
     # Configure dataset-specific arguments
     args = configure_dataset_args(args)
@@ -1046,50 +948,6 @@ def inference(args: argparse.Namespace) -> None:
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Using device: {device}")
-    
-    # Test model on CPU first to verify it works
-    print("Testing model on CPU first...")
-    try:
-        # Create a small test input
-        test_input = torch.randn(1, args.seq_len, args.enc_in)
-        test_x_mark = torch.randn(1, args.seq_len, 4)  # Assuming 4 time features
-        test_dec = torch.randn(1, args.pred_len, args.enc_in)
-        test_y_mark = torch.randn(1, args.pred_len, 4)
-        
-        # Test on CPU
-        model_cpu = model.cpu()
-        with torch.no_grad():
-            test_output = model_cpu(test_input, test_x_mark, test_dec, test_y_mark)
-        print(f"CPU test successful: input {test_input.shape} -> output {test_output.shape}")
-        
-        # Move model back to target device with error handling
-        try:
-            model = model.to(device)
-            print(f"Model moved to {device}")
-        except RuntimeError as e:
-            if "CUDA" in str(e):
-                print(f"CUDA error when moving model to GPU: {e}")
-                print("The GraphSSM model contains CUDA kernels that are causing memory issues.")
-                print("Falling back to CPU execution...")
-                device = torch.device("cpu")
-                model = model.cpu()  # Model is already on CPU
-                print("Continuing with CPU execution")
-            else:
-                raise
-        
-    except Exception as e:
-        print(f"CPU test failed: {e}")
-        print("This suggests the issue is in the model architecture, not CUDA-specific")
-        return None, None
-    
-    # Clear CUDA cache before starting inference
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
-        print("Cleared CUDA cache before inference")
-        
-        # Check CUDA memory
-        print(f"CUDA memory allocated: {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
-        print(f"CUDA memory cached: {torch.cuda.memory_reserved(device) / 1024**2:.2f} MB")
     
     # Run Nsight Compute profiling for exact TFLOPS measurement
     nsight_results = None
@@ -1124,94 +982,32 @@ def inference(args: argparse.Namespace) -> None:
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
                 if i >= args.warmup_batches:
                     break
-                
-                try:
-                    print(f"Warmup batch {i+1}: Processing batch shapes - batch_x: {batch_x.shape}, batch_y: {batch_y.shape}")
-                    
-                    # Move to device with error handling
-                    batch_x = batch_x.to(device).float()
-                    batch_y = batch_y.to(device).float()
-                    batch_x_mark = batch_x_mark.to(device).float()
-                    batch_y_mark = batch_y_mark.to(device).float()
-                    dec_inp = torch.zeros_like(batch_y).float().to(device)
-                    
-                    print(f"Warmup batch {i+1}: Data moved to device successfully")
-                    
-                    # Test model forward pass with error handling
-                    _ = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    print(f"Warmup batch {i+1}: Model forward pass completed successfully")
-                    
-                except RuntimeError as e:
-                    print(f"Error in warmup batch {i+1}: {e}")
-                    print(f"Batch shapes: batch_x={batch_x.shape}, batch_y={batch_y.shape}")
-                    print(f"Device: {device}")
-                    
-                    # If it's a CUDA error and fallback is enabled, try CPU
-                    if "CUDA" in str(e) and args.fallback_cpu and device.type == 'cuda':
-                        print("CUDA error detected, falling back to CPU...")
-                        device = torch.device("cpu")
-                        model = model.cpu()
-                        print("Model moved to CPU")
-                        break  # Exit warmup and continue with CPU
-                    else:
-                        # Try to clear CUDA cache and continue
-                        if device.type == 'cuda':
-                            torch.cuda.empty_cache()
-                            print("Cleared CUDA cache")
-                        
-                        # Skip this batch and continue
-                        continue
-    
-    # Main inference loop with TFLOPS calculation
-    with torch.no_grad():
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
-            try:
                 batch_x = batch_x.to(device).float()
                 batch_y = batch_y.to(device).float()
                 batch_x_mark = batch_x_mark.to(device).float()
                 batch_y_mark = batch_y_mark.to(device).float()
-                
-                # Create decoder input (zeros for inference)
                 dec_inp = torch.zeros_like(batch_y).float().to(device)
-                
-                # Start timing for this batch
-                tflops_calc.start_timing()
-                
-                # Forward pass
-                predictions = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                
-                # End timing for this batch
-                batch_time = tflops_calc.end_timing()
-                
-            except RuntimeError as e:
-                print(f"Error in main inference batch {i+1}: {e}")
-                
-                # If it's a CUDA error and fallback is enabled, try CPU
-                if "CUDA" in str(e) and args.fallback_cpu and device.type == 'cuda':
-                    print("CUDA error detected, falling back to CPU...")
-                    device = torch.device("cpu")
-                    model = model.cpu()
-                    print("Model moved to CPU")
-                    
-                    # Retry the batch on CPU
-                    try:
-                        batch_x = batch_x.cpu().float()
-                        batch_y = batch_y.cpu().float()
-                        batch_x_mark = batch_x_mark.cpu().float()
-                        batch_y_mark = batch_y_mark.cpu().float()
-                        dec_inp = torch.zeros_like(batch_y).float()
-                        
-                        tflops_calc.start_timing()
-                        predictions = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        batch_time = tflops_calc.end_timing()
-                        print(f"Batch {i+1} completed successfully on CPU")
-                    except Exception as cpu_e:
-                        print(f"CPU fallback also failed: {cpu_e}")
-                        continue
-                else:
-                    # Skip this batch
-                    print(f"Skipping batch {i+1}")
-                    continue
+                _ = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+    
+    # Main inference loop with TFLOPS calculation
+    with torch.no_grad():
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+            batch_x = batch_x.to(device).float()
+            batch_y = batch_y.to(device).float()
+            batch_x_mark = batch_x_mark.to(device).float()
+            batch_y_mark = batch_y_mark.to(device).float()
+            
+            # Create decoder input (zeros for inference)
+            dec_inp = torch.zeros_like(batch_y).float().to(device)
+            
+            # Start timing for this batch
+            tflops_calc.start_timing()
+            
+            # Forward pass
+            predictions = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            
+            # End timing for this batch
+            batch_time = tflops_calc.end_timing()
             
             # Calculate FLOPs for this batch
             batch_flops = count_model_flops(model, batch_x.shape, args)
@@ -1562,12 +1358,6 @@ Examples:
 
   # Run with profiling and custom workspace
   python ET_eval.py --mode inference --use_solar --profile_detailed --nsight_compute --workspace /home/user/gg_ssms
-
-  # Run on CPU to avoid GraphSSM CUDA issues
-  python ET_eval.py --mode inference --force_cpu --workspace workspace
-
-  # Run with CPU fallback if CUDA fails
-  python ET_eval.py --mode inference --fallback_cpu --workspace workspace
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1652,9 +1442,6 @@ Examples:
     parser.add_argument("--gpu", type=int, default=0, help="gpu")
     parser.add_argument("--use_multi_gpu", action="store_true", help="use multiple gpus", default=False)
     parser.add_argument("--devices", type=str, default="0,1,2,3", help="device ids of multile gpus")
-    parser.add_argument("--fallback_cpu", action="store_true", help="fallback to CPU if CUDA fails", default=False)
-    parser.add_argument("--force_cpu", action="store_true", 
-                       help="force CPU execution (recommended for GraphSSM due to CUDA kernel memory issues)", default=False)
     
     # De-stationary projector params
     parser.add_argument("--p_hidden_dims", type=int, nargs="+", default=[128, 128], help="hidden layer dimensions of projector")
@@ -1736,12 +1523,8 @@ if __name__ == "__main__":
             run_example()
         else:
             print("\nStarting inference...")
-            result = inference(args)
-            if result is not None:
-                predictions, targets = result
-                print("\nInference completed!")
-            else:
-                print("\nInference failed - see error messages above.")
+            predictions, targets = inference(args)
+            print("\nInference completed!")
     else:
         print("\nStarting training...")
         # Note: Training function would need to be re-added if needed
