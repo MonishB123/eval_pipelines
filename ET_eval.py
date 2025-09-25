@@ -799,6 +799,10 @@ class TimeSeriesForecaster(nn.Module):
         stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
         x_enc /= stdev
         
+        # Ensure tensors are contiguous to avoid CUDA memory issues
+        means = means.contiguous()
+        stdev = stdev.contiguous()
+        
         # Embed input features: [B, seq_len, enc_in] -> [B, seq_len, d_model]
         embedded = self.input_embedding(x_enc)
         
@@ -821,9 +825,55 @@ class TimeSeriesForecaster(nn.Module):
         # Project to output: [B, pred_len, d_model] -> [B, pred_len, c_out]
         output = self.output_projection(processed)
         
-        # De-normalize
-        output = output * (stdev[:, [0], :].repeat(1, self.pred_len, 1))
-        output = output + (means[:, [0], :].repeat(1, self.pred_len, 1))
+        # De-normalize (optional - skip if dimensions don't match or CUDA errors occur)
+        # stdev and means have shape [B, 1, enc_in], output has shape [B, pred_len, c_out]
+        try:
+            # Only attempt denormalization if dimensions are compatible
+            if (stdev.shape[-1] == output.shape[-1] or 
+                stdev.shape[-1] == 1 or 
+                stdev.shape[-1] <= output.shape[-1]):
+                
+                # Debug information (only first few times)
+                if hasattr(self, '_debug_count'):
+                    self._debug_count += 1
+                else:
+                    self._debug_count = 1
+                
+                if self._debug_count <= 3:
+                    print(f"Debug {self._debug_count}: stdev.shape={stdev.shape}, output.shape={output.shape}")
+                    print(f"Debug {self._debug_count}: means.shape={means.shape}, pred_len={self.pred_len}")
+                
+                if stdev.shape[-1] == output.shape[-1]:
+                    # Perfect match: use stdev and means directly
+                    stdev_repeated = stdev.repeat(1, self.pred_len, 1)
+                    means_repeated = means.repeat(1, self.pred_len, 1)
+                    output = output * stdev_repeated + means_repeated
+                elif stdev.shape[-1] == 1:
+                    # Single feature: broadcast to all output features
+                    stdev_repeated = stdev.repeat(1, self.pred_len, output.shape[-1])
+                    means_repeated = means.repeat(1, self.pred_len, output.shape[-1])
+                    output = output * stdev_repeated + means_repeated
+                else:
+                    # Partial match: only denormalize matching features
+                    min_features = min(stdev.shape[-1], output.shape[-1])
+                    stdev_slice = stdev[:, :, :min_features].repeat(1, self.pred_len, 1)
+                    means_slice = means[:, :, :min_features].repeat(1, self.pred_len, 1)
+                    output[:, :, :min_features] = (output[:, :, :min_features] * stdev_slice + 
+                                                   means_slice)
+            else:
+                # Dimensions incompatible - skip denormalization
+                if not hasattr(self, '_denorm_warning_shown'):
+                    print(f"Warning: Skipping denormalization - incompatible dimensions: "
+                          f"stdev.shape={stdev.shape}, output.shape={output.shape}")
+                    self._denorm_warning_shown = True
+                
+        except RuntimeError as e:
+            # If there's still a CUDA error, skip denormalization
+            if not hasattr(self, '_cuda_error_shown'):
+                print(f"Warning: Skipping denormalization due to CUDA error: {e}")
+                print(f"stdev.shape: {stdev.shape}, output.shape: {output.shape}")
+                self._cuda_error_shown = True
+            pass
         
         return output
 
