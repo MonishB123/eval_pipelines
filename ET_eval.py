@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.profiler import profile, record_function, ProfilerActivity
+import matplotlib.pyplot as plt
 
 # Add MambaTS to path to use their data providers
 # Since eval_forecasting.py is now in ~/data and gg_ssms repo is in ~/workspace
@@ -57,9 +58,6 @@ if not os.path.exists(main_py_path):
 
 sys.path.append(os.path.join(gg_ssms_path, "core", "graph_ssm"))
 from main import GraphSSM
-
-
-# Remove the synthetic dataset class - we'll use MambaTS data providers instead
 
 
 class TFLOPSCalculator:
@@ -303,14 +301,104 @@ if __name__ == "__main__":
         print("Please download the ETT dataset and place it in the correct location.")
         exit(1)
     
-    if args.mode == "inference" or args.example:
-        if args.example:
-            print("\nRunning simple example...")
-            run_example()
-        else:
-            print("\nStarting inference...")
-            predictions, targets = inference(args)
-            print("\nInference completed!")
-    else:
-        print("\nStarting training...")
-        print("Training mode not implemented in this inference-only version.")
+    # Device selection
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    
+    # Prepare dataset using MambaTS
+    dataset, data_loader = data_provider(
+        dataset_name=args.data,
+        root_path=args.root_path,
+        data_path=args.data_path,
+        flag="test",
+        size=[args.seq_len, args.pred_len],
+        features=args.features,
+        target=args.target,
+        inverse=args.inverse,
+        timeenc=args.timeenc,
+        freq=args.freq,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+    
+    # Hard-coded list of distance formulas to test
+    distance_metrics_to_test = ["cosine", "euclidean", "manhattan", "gaussian", "norm2"]
+    
+    # Store results for plotting
+    results = []
+
+    for distance in distance_metrics_to_test:
+        print(f"\nEvaluating distance metric: {distance.upper()}")
+        
+        # Load model with the current distance metric
+        args.distance = distance
+        model = load_pretrained_model(args.model_path, args, device)
+        
+        tflops_calculator = TFLOPSCalculator()
+        
+        # Warmup
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(data_loader):
+            if i >= args.warmup_batches:
+                break
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            batch_x_mark, batch_y_mark = batch_x_mark.to(device), batch_y_mark.to(device)
+            with torch.no_grad():
+                _ = model(batch_x, batch_x_mark, batch_y, batch_y_mark)
+        
+        # Timed inference
+        total_flops = 0
+        total_time = 0
+        batch_count = 0
+        for batch_x, batch_y, batch_x_mark, batch_y_mark in data_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            batch_x_mark, batch_y_mark = batch_x_mark.to(device), batch_y_mark.to(device)
+            b, seq_len, enc_in = batch_x.shape
+            
+            # Count FLOPs for this batch
+            flops = count_model_flops(model, batch_x.shape, args)
+            tflops_calculator.add_flops(flops)
+            
+            tflops_calculator.start_timing()
+            with torch.no_grad():
+                _ = model(batch_x, batch_x_mark, batch_y, batch_y_mark)
+            batch_time = tflops_calculator.end_timing()
+            
+            total_flops += flops
+            total_time += batch_time
+            batch_count += 1
+        
+        avg_batch_time = total_time / batch_count if batch_count > 0 else 0
+        tflops = tflops_calculator.calculate_tflops()
+        
+        results.append({
+            "distance": distance,
+            "avg_batch_time": avg_batch_time,
+            "tflops": tflops
+        })
+        
+        print(f"Average batch time: {avg_batch_time:.4f} s, TFLOPS: {tflops:.4f}")
+    
+    # Generate bar chart
+    distance_labels = [r["distance"] for r in results]
+    avg_times = [r["avg_batch_time"] for r in results]
+    tflops_vals = [r["tflops"] for r in results]
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    color = 'tab:blue'
+    ax1.set_xlabel('Distance Metric')
+    ax1.set_ylabel('Avg Batch Time (s)', color=color)
+    ax1.bar(distance_labels, avg_times, color=color, alpha=0.6, label='Avg Batch Time')
+    ax1.tick_params(axis='y', labelcolor=color)
+
+    ax2 = ax1.twinx()
+    color = 'tab:red'
+    ax2.set_ylabel('TFLOPS', color=color)
+    ax2.plot(distance_labels, tflops_vals, color=color, marker='o', linewidth=2, label='TFLOPS')
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    fig.tight_layout()
+    plt.title('GraphSSM Inference Performance Across Distance Metrics')
+    ax1.legend(loc='upper left')
+    ax2.legend(loc='upper right')
+    plt.show()
